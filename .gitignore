@@ -1,0 +1,50 @@
+# macOS
+.DS_Store
+
+# Images
+*.jpg
+*.jpeg
+*.JPG
+*.JPEG
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Environment
+.env
+.venv
+env/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Data
+tiny-imagenet-data/
+Model_Zoo/
+Pretrained_Components/
+
+# Checkpoints
+*.ckpt
+*.pth
+checkpoints/
+components/
+
+# Logs
+logs/
+lightning_logs/
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
