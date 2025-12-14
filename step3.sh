@@ -47,7 +47,11 @@ embed_dim=1024           # Embedding dimension
 temperature=0.07         # Contrastive loss temperature
 num_workers=4            # DataLoader workers
 seed=42                  # Random seed
-gpus=1                   # Number of GPUs
+gpus=0                   # Keep 0 on macOS; use --accelerator mps below
+
+# Device settings (Apple Silicon)
+accelerator="mps"
+devices=1
 
 val_split=0.1            # Validation split ratio
 
@@ -107,6 +111,8 @@ cmd="python train_task_encoder.py \
     --num_workers $num_workers \
     --seed $seed \
     --gpus $gpus \
+    --accelerator $accelerator \
+    --devices $devices \
     --val_split $val_split"
 
 # Add VAE checkpoint if specified

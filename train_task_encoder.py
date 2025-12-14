@@ -698,6 +698,21 @@ def main():
                         help="Random seed")
     parser.add_argument("--gpus", type=int, default=1,
                         help="Number of GPUs to use")
+
+    # Device control (macOS/MPS friendly)
+    parser.add_argument(
+        "--accelerator",
+        type=str,
+        default=None,
+        choices=["cpu", "cuda", "mps"],
+        help="Explicit accelerator override; if unset, derived from --gpus and availability",
+    )
+    parser.add_argument(
+        "--devices",
+        type=int,
+        default=None,
+        help="Number of devices (used with --accelerator). If unset, derived from --gpus",
+    )
     
     args = parser.parse_args()
     
@@ -769,13 +784,20 @@ def main():
         ),
         LearningRateMonitor(logging_interval='epoch')
     ]
+
+    if args.accelerator is not None:
+        accelerator = args.accelerator
+        devices = args.devices if args.devices is not None else 1
+    else:
+        accelerator = 'cuda' if args.gpus > 0 and torch.cuda.is_available() else 'cpu'
+        devices = args.gpus if args.gpus > 0 else 1
     
     # Trainer
     trainer = pl.Trainer(
         default_root_dir=output_path,
         max_epochs=args.epochs,
-        accelerator='gpu' if args.gpus > 0 else 'cpu',
-        devices=args.gpus if args.gpus > 0 else 'auto',
+        accelerator=accelerator,
+        devices=devices,
         callbacks=callbacks,
         log_every_n_steps=10,
         gradient_clip_val=1.0,

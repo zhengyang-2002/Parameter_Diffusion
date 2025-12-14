@@ -450,7 +450,22 @@ class Encoder(nn.Module):
         x = x.reshape(-1, self.fch, self.in_dim)
         x = self.fc_in(x)
         x = F.leaky_relu(x)
-        x = x.reshape(-1, self.in_channels, self.resolution, self.resolution)
+        # Historically some checkpoints use rectangular feature maps (H=resolution, W inferred from fdim)
+        # instead of forcing square (resolution x resolution). Preserve backwards compatibility.
+        total_per_sample = self.fch * self.fdim
+        square = self.in_channels * self.resolution * self.resolution
+        if total_per_sample == square:
+            x = x.reshape(-1, self.in_channels, self.resolution, self.resolution)
+        else:
+            denom = self.in_channels * self.resolution
+            if total_per_sample % denom != 0:
+                raise RuntimeError(
+                    "Encoder cannot reshape fc features into 2D map. "
+                    f"fch*fdim={total_per_sample} not divisible by in_channels*resolution={denom}. "
+                    f"(fch={self.fch}, fdim={self.fdim}, in_channels={self.in_channels}, resolution={self.resolution})"
+                )
+            width = total_per_sample // denom
+            x = x.reshape(-1, self.in_channels, self.resolution, width)
         # downsampling
         hs = [self.conv_in(x)]
         for i_level in range(self.num_resolutions):
@@ -582,7 +597,27 @@ class Decoder(nn.Module):
         h = self.norm_out(h)
         h = nonlinearity(h)
         h = self.conv_out(h)
-        h = h.reshape(-1, self.fch, self.fdim)
+        # Mirror Encoder's potentially-rectangular reshape
+        total_per_sample = self.fch * self.fdim
+        square = h.shape[1] * self.resolution * self.resolution
+        if total_per_sample == square:
+            h = h.reshape(-1, self.fch, self.fdim)
+        else:
+            denom = h.shape[1] * self.resolution
+            if total_per_sample % denom != 0:
+                raise RuntimeError(
+                    "Decoder cannot reshape conv map into (fch, fdim). "
+                    f"fch*fdim={total_per_sample} not divisible by out_ch*resolution={denom}. "
+                    f"(fch={self.fch}, fdim={self.fdim}, out_ch={h.shape[1]}, resolution={self.resolution})"
+                )
+            width = total_per_sample // denom
+            # ensure current conv map matches expected (out_ch, resolution, width)
+            if h.shape[2] != self.resolution or h.shape[3] != width:
+                raise RuntimeError(
+                    "Decoder got unexpected spatial shape from conv_out. "
+                    f"got={tuple(h.shape)}, expected=(B,{h.shape[1]},{self.resolution},{width})"
+                )
+            h = h.reshape(-1, self.fch, self.fdim)
         h = self.fc_out(h)
         h = rearrange(h, 'b c h -> b (c h)')
         # h = torch.sigmoid(h)
@@ -944,7 +979,20 @@ class NNPredictor(nn.Module):
         x = x.reshape(-1, self.fch, self.in_dim)
         x = self.fc_in(x)
         x = F.leaky_relu(x)
-        x = x.reshape(-1, self.in_channels, self.resolution, self.resolution)
+        total_per_sample = self.fch * self.fdim
+        square = self.in_channels * self.resolution * self.resolution
+        if total_per_sample == square:
+            x = x.reshape(-1, self.in_channels, self.resolution, self.resolution)
+        else:
+            denom = self.in_channels * self.resolution
+            if total_per_sample % denom != 0:
+                raise RuntimeError(
+                    "Encoder cannot reshape fc features into 2D map. "
+                    f"fch*fdim={total_per_sample} not divisible by in_channels*resolution={denom}. "
+                    f"(fch={self.fch}, fdim={self.fdim}, in_channels={self.in_channels}, resolution={self.resolution})"
+                )
+            width = total_per_sample // denom
+            x = x.reshape(-1, self.in_channels, self.resolution, width)
         # downsampling
         hs = [self.conv_in(x)]
         for i_level in range(self.num_resolutions):

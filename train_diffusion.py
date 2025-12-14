@@ -24,6 +24,7 @@ import sys
 import json
 import argparse
 import datetime
+import tempfile
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 
@@ -257,15 +258,28 @@ class VAEWrapper(nn.Module):
     
     def encode(self, x):
         """Encode weights to latent space."""
+        out_device = x.device
+        try:
+            vae_device = next(self.vae.parameters()).device
+        except StopIteration:
+            vae_device = torch.device('cpu')
+        x_in = x.detach().to(vae_device)
         with torch.no_grad():
-            posterior = self.vae.encode(x)
+            posterior = self.vae.encode(x_in)
             z = posterior.sample()
-        return z
+        return z.to(out_device)
     
     def decode(self, z):
         """Decode latent to weights."""
+        out_device = z.device
+        try:
+            vae_device = next(self.vae.parameters()).device
+        except StopIteration:
+            vae_device = torch.device('cpu')
+        z_in = z.detach().to(vae_device)
         with torch.no_grad():
-            return self.vae.decode(z)
+            x = self.vae.decode(z_in)
+        return x.to(out_device)
 
 
 # ==============================================================================
@@ -329,14 +343,16 @@ class SimpleTaskEncoder(nn.Module):
         num_samples: int = 5,
         embed_dim: int = 256,
         latent_channels: int = 4,
-        latent_size: int = 16,
+        latent_h: int = 16,
+        latent_w: int = 16,
     ):
         super().__init__()
         
         self.num_classes = num_classes
         self.num_samples = num_samples
         self.latent_channels = latent_channels
-        self.latent_size = latent_size
+        self.latent_h = latent_h
+        self.latent_w = latent_w
         
         # Simple CNN to encode each image
         self.image_encoder = nn.Sequential(
@@ -363,7 +379,7 @@ class SimpleTaskEncoder(nn.Module):
         )
         
         # Project to condition size (matches latent size)
-        self.proj = nn.Linear(embed_dim, latent_channels * latent_size * latent_size)
+        self.proj = nn.Linear(embed_dim, latent_channels * latent_h * latent_w)
     
     def forward(self, dataset_samples):
         """
@@ -371,7 +387,7 @@ class SimpleTaskEncoder(nn.Module):
             dataset_samples: List of (num_classes, num_samples, 3, H, W) tensors
         
         Returns:
-            condition: (batch, latent_channels, latent_size, latent_size)
+            condition: (batch, latent_channels, latent_h, latent_w)
         """
         batch_outputs = []
         
@@ -399,8 +415,8 @@ class SimpleTaskEncoder(nn.Module):
         batch_features = torch.stack(batch_outputs)  # (batch, embed_dim)
         
         # Project to latent size
-        cond = self.proj(batch_features)  # (batch, latent_channels * latent_size * latent_size)
-        cond = cond.view(-1, self.latent_channels, self.latent_size, self.latent_size)
+        cond = self.proj(batch_features)  # (batch, latent_channels * latent_h * latent_w)
+        cond = cond.view(-1, self.latent_channels, self.latent_h, self.latent_w)
         
         return cond
 
@@ -615,6 +631,8 @@ class LatentDiffusionModule(pl.LightningModule):
         weight_decay: float = 1e-5,
         latent_channels: int = 4,
         latent_size: int = 16,
+        latent_h: Optional[int] = None,
+        latent_w: Optional[int] = None,
         num_classes: int = 10,
         num_samples: int = 5,
         use_ema: bool = True,
@@ -627,30 +645,71 @@ class LatentDiffusionModule(pl.LightningModule):
         self.weight_decay = weight_decay
         self.num_timesteps = num_timesteps
         self.latent_channels = latent_channels
-        self.latent_size = latent_size
-        
+        if latent_h is None:
+            latent_h = latent_size
+        if latent_w is None:
+            latent_w = latent_size
+        self.latent_h = int(latent_h)
+        self.latent_w = int(latent_w)
+
+        # Keep Lightning hparams in sync (useful for checkpoints/logs)
+        self.hparams["latent_h"] = self.latent_h
+        self.hparams["latent_w"] = self.latent_w
+
         # VAE (for encoding/decoding weights)
         if vae_checkpoint and os.path.exists(vae_checkpoint):
-            self.vae = VAEWrapper(vae_checkpoint, dnnwg_path)
+            # Keep the trained VAE off the Lightning device management path.
+            # (It may not support MPS/CUDA reliably; we move tensors in/out in the wrapper.)
+            object.__setattr__(self, 'trained_vae', VAEWrapper(vae_checkpoint, dnnwg_path, device='cpu'))
             self.use_trained_vae = True
+
+            inferred = self._infer_trained_vae_latent_spec()
+            if inferred is None:
+                print(
+                    "[Warning] Provided VAE checkpoint is incompatible (could not infer a stable 4D latent while preserving batch). "
+                    "Falling back to SimpleVAE."
+                )
+                self.vae = SimpleVAE(
+                    input_dim=5130,
+                    latent_dim=self.latent_channels * self.latent_h * self.latent_w,
+                )
+                self.use_trained_vae = False
+            else:
+                inferred_c, inferred_h, inferred_w = inferred
+                if inferred_c != self.latent_channels or inferred_h != self.latent_h or inferred_w != self.latent_w:
+                    print(
+                        "[Info] Inferred latent spec from trained VAE: "
+                        f"(C,H,W)=({inferred_c},{inferred_h},{inferred_w}) "
+                        "(overriding provided --latent_channels/--latent_size/--latent_h/--latent_w)."
+                    )
+                self.latent_channels = int(inferred_c)
+                self.latent_h = int(inferred_h)
+                self.latent_w = int(inferred_w)
+                self.hparams["latent_channels"] = self.latent_channels
+                self.hparams["latent_h"] = self.latent_h
+                self.hparams["latent_w"] = self.latent_w
         else:
             print("Using simple VAE (no checkpoint provided)")
-            self.vae = SimpleVAE(input_dim=5130, latent_dim=latent_channels * latent_size * latent_size)
+            self.vae = SimpleVAE(
+                input_dim=5130,
+                latent_dim=self.latent_channels * self.latent_h * self.latent_w,
+            )
             self.use_trained_vae = False
         
         # Task encoder (dataset conditioning)
         self.task_encoder = SimpleTaskEncoder(
             num_classes=num_classes,
             num_samples=num_samples,
-            latent_channels=latent_channels,
-            latent_size=latent_size,
+            latent_channels=self.latent_channels,
+            latent_h=self.latent_h,
+            latent_w=self.latent_w,
         )
         
         # UNet
         self.unet = SimpleUNet(
-            in_channels=latent_channels,
-            out_channels=latent_channels,
-            cond_channels=latent_channels,
+            in_channels=self.latent_channels,
+            out_channels=self.latent_channels,
+            cond_channels=self.latent_channels,
             base_channels=128,
             channel_mult=[1, 2, 4],
         )
@@ -678,18 +737,58 @@ class LatentDiffusionModule(pl.LightningModule):
                             betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod))
         self.register_buffer('posterior_mean_coef2',
                             (1.0 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - alphas_cumprod))
+
+    def _infer_trained_vae_latent_spec(self) -> Optional[tuple[int, int, int]]:
+        """Infer (C,H,W) latent spec from the trained VAE.
+
+        Requirements:
+        - encode() returns a 4D tensor
+        - preserves batch size
+        """
+        try:
+            dummy_bs = 2
+            dummy_weights = torch.zeros(dummy_bs, 5130)
+            with torch.no_grad():
+                z = self.trained_vae.encode(dummy_weights)
+
+            if not isinstance(z, torch.Tensor):
+                print(f"[VAE check] Unexpected encode() return type: {type(z)}")
+                return None
+            if z.dim() != 4:
+                print(f"[VAE check] Expected 4D latent, got shape {tuple(z.shape)}")
+                return None
+            if z.shape[0] != dummy_bs:
+                print(
+                    f"[VAE check] Batch size changed during encode(). Expected B={dummy_bs}, got B={z.shape[0]} (shape={tuple(z.shape)})"
+                )
+                return None
+            c, h, w = int(z.shape[1]), int(z.shape[2]), int(z.shape[3])
+            return (c, h, w)
+        except Exception as e:
+            print(f"[VAE check] Failed to encode dummy batch: {e}")
+            return None
     
     def encode_weights(self, weights):
         """Encode weights to latent space."""
         if self.use_trained_vae:
-            z = self.vae.encode(weights)
-            # Reshape to (batch, channels, h, w) for UNet
-            batch_size = weights.shape[0]
-            z = z.view(batch_size, self.latent_channels, self.latent_size, self.latent_size)
+            z = self.trained_vae.encode(weights)
         else:
             z = self.vae.encode(weights)
-            z = z.view(-1, self.latent_channels, self.latent_size, self.latent_size)
-        return z
+
+        if self.use_trained_vae:
+            if z.dim() != 4:
+                raise RuntimeError(f"Trained VAE returned non-4D latent: shape={tuple(z.shape)}")
+            if tuple(z.shape[1:]) != (self.latent_channels, self.latent_h, self.latent_w):
+                raise RuntimeError(
+                    "Trained VAE returned unexpected latent spatial shape: "
+                    f"got={tuple(z.shape)}, expected=(B,{self.latent_channels},{self.latent_h},{self.latent_w})"
+                )
+            return z
+
+        # SimpleVAE path: returns flattened latent
+        if z.dim() != 2:
+            z = z.view(z.shape[0], -1)
+        return z.view(-1, self.latent_channels, self.latent_h, self.latent_w)
     
     def decode_latent(self, z):
         """Decode latent to weights."""
@@ -697,8 +796,7 @@ class LatentDiffusionModule(pl.LightningModule):
         z_flat = z.view(batch_size, -1)
         
         if self.use_trained_vae:
-            z_reshape = z.view(batch_size, self.latent_channels, self.latent_size, self.latent_size)
-            return self.vae.decode(z_reshape)
+            return self.trained_vae.decode(z)
         else:
             return self.vae.decode(z_flat)
     
@@ -782,7 +880,7 @@ class LatentDiffusionModule(pl.LightningModule):
         device = self.device
         
         # Start from noise
-        shape = (num_samples, self.latent_channels, self.latent_size, self.latent_size)
+        shape = (num_samples, self.latent_channels, self.latent_h, self.latent_w)
         x = torch.randn(shape, device=device)
         
         # Denoise
@@ -918,6 +1016,10 @@ def main():
                         choices=["linear", "cosine"])
     parser.add_argument("--latent_channels", type=int, default=4)
     parser.add_argument("--latent_size", type=int, default=16)
+    parser.add_argument("--latent_h", type=int, default=None,
+                        help="Optional latent height. If unset, defaults to --latent_size.")
+    parser.add_argument("--latent_w", type=int, default=None,
+                        help="Optional latent width. If unset, defaults to --latent_size.")
     
     # Training params
     parser.add_argument("--epochs", type=int, default=500)
@@ -925,11 +1027,26 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--log_every_n_steps", type=int, default=10,
+                        help="Log interval in steps. Use 1 for immediate feedback.")
+    parser.add_argument("--dry_run", action="store_true",
+                        help="Quick smoke test: uses tiny training (1 train + 1 val batch) and exits. Disables checkpointing/logging.")
     parser.add_argument("--accelerator", type=str, default="auto",
                         help="Accelerator: 'mps' for Mac, 'cuda' for NVIDIA, 'cpu', or 'auto'")
     parser.add_argument("--devices", type=int, default=1)
     
     args = parser.parse_args()
+
+    if args.dry_run:
+        # Force a tiny, fast run (mainly for verifying shapes + device wiring)
+        args.epochs = 1
+        args.num_subsets = min(args.num_subsets, 8)
+        args.batch_size = min(args.batch_size, 2)
+        args.num_workers = 0
+        args.val_split = 0.5
+        args.log_every_n_steps = 1
+        # Avoid polluting the main output directory
+        args.output_dir = tempfile.mkdtemp(prefix="diffusion_dry_run_")
     
     # Set seed
     pl.seed_everything(args.seed)
@@ -954,12 +1071,15 @@ def main():
     print(f"TinyImageNet train: {tinyimagenet_train}")
     print(f"VAE checkpoint: {args.vae_checkpoint}")
     print(f"Output directory: {args.output_dir}")
+    if args.dry_run:
+        print("[Dry run] Running 1 train batch + 1 val batch, then exiting.")
     print("=" * 60)
     
     # Save config
-    config = vars(args)
-    with open(output_path / 'config.yaml', 'w') as f:
-        yaml.dump(config, f)
+    if not args.dry_run:
+        config = vars(args)
+        with open(output_path / 'config.yaml', 'w') as f:
+            yaml.dump(config, f)
     
     # Data module
     dm = DiffusionDataModule(
@@ -983,27 +1103,31 @@ def main():
         learning_rate=args.lr,
         latent_channels=args.latent_channels,
         latent_size=args.latent_size,
+        latent_h=args.latent_h,
+        latent_w=args.latent_w,
         num_classes=args.num_classes,
         num_samples=args.num_samples,
     )
     
-    # Callbacks
-    callbacks = [
-        ModelCheckpoint(
-            dirpath=output_path / 'checkpoints',
-            filename='diffusion-{epoch:02d}-{val/loss:.4f}',
-            monitor='val/loss',
-            mode='min',
-            save_top_k=3,
-            save_last=True
-        ),
-        EarlyStopping(
-            monitor='val/loss',
-            patience=50,
-            mode='min'
-        ),
-        LearningRateMonitor(logging_interval='epoch')
-    ]
+    # Callbacks (disabled in dry_run)
+    callbacks = []
+    if not args.dry_run:
+        callbacks = [
+            ModelCheckpoint(
+                dirpath=output_path / 'checkpoints',
+                filename='diffusion-{epoch:02d}-{val/loss:.4f}',
+                monitor='val/loss',
+                mode='min',
+                save_top_k=3,
+                save_last=True
+            ),
+            EarlyStopping(
+                monitor='val/loss',
+                patience=50,
+                mode='min'
+            ),
+            LearningRateMonitor(logging_interval='epoch')
+        ]
     
     # Trainer
     trainer = pl.Trainer(
@@ -1012,15 +1136,23 @@ def main():
         accelerator=args.accelerator,
         devices=args.devices,
         callbacks=callbacks,
-        log_every_n_steps=10,
+        log_every_n_steps=args.log_every_n_steps,
         gradient_clip_val=1.0,
+        enable_checkpointing=(not args.dry_run),
+        logger=(False if args.dry_run else True),
+        limit_train_batches=(1 if args.dry_run else 1.0),
+        limit_val_batches=(1 if args.dry_run else 1.0),
+        num_sanity_val_steps=(0 if args.dry_run else 2),
     )
     
     print("\nStarting Diffusion Model training...")
     trainer.fit(model, dm)
     
     print("\nTraining complete!")
-    print(f"Best checkpoint: {trainer.checkpoint_callback.best_model_path}")
+    if getattr(trainer, "checkpoint_callback", None) is not None:
+        print(f"Best checkpoint: {trainer.checkpoint_callback.best_model_path}")
+    else:
+        print("Checkpointing disabled (dry_run).")
 
 
 if __name__ == "__main__":

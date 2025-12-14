@@ -24,6 +24,12 @@
 
 # --- Configuration ---
 
+# Quick sanity toggle:
+# - 1: fast smoke test (prints progress quickly, exits)
+# - 0: full training
+dry_run=0
+log_every_n_steps=1
+
 # Path to trained classifier heads from Step 1
 weights_dir="./Model_Zoo/Resnet18_TinyImageNet_HC"
 
@@ -37,7 +43,7 @@ vae_checkpoint="./Pretrained_Components/VAE"
 
 # (Optional) Task Encoder checkpoint from Step 3
 # If not provided, task encoder is trained jointly with diffusion
-task_encoder_checkpoint=""
+task_encoder_checkpoint="/Users/supawich/Documents/Duke/Term1/PracticalML/Parameter_Diffusion/components/task_encoder/checkpoints/task_encoder-epoch=10-val/loss=2.6895.ckpt"
 # task_encoder_checkpoint="./components/task_encoder/checkpoints/last.ckpt"
 
 # Path to DNNWG library
@@ -72,6 +78,16 @@ devices=1                # Number of devices
 
 val_split=0.1            # Validation split
 
+if [ "$dry_run" -eq 1 ]; then
+    num_subsets=8
+    num_samples=1
+    num_timesteps=25
+    epochs=1
+    batch_size=2
+    num_workers=0
+    val_split=0.5
+fi
+
 # --- Download TinyImageNet if needed ---
 if [ ! -d "$tinyimagenet_dir" ]; then
     echo "TinyImageNet not found. Downloading..."
@@ -105,6 +121,9 @@ echo "Model parameters:"
 echo "  - Diffusion timesteps: $num_timesteps"
 echo "  - Beta schedule: $beta_schedule"
 echo "  - Latent size: ${latent_channels}x${latent_size}x${latent_size}"
+if [ "$dry_run" -eq 1 ]; then
+    echo "  - Mode: DRY RUN (1 train + 1 val batch)"
+fi
 echo ""
 echo "Training parameters:"
 echo "  - Epochs: $epochs"
@@ -131,9 +150,14 @@ cmd="python train_diffusion.py \
     --lr $lr \
     --num_workers $num_workers \
     --seed $seed \
+    --log_every_n_steps $log_every_n_steps \
     --accelerator $accelerator \
     --devices $devices \
     --val_split $val_split"
+
+if [ "$dry_run" -eq 1 ]; then
+    cmd="$cmd --dry_run"
+fi
 
 # Add VAE checkpoint if specified
 if [ -n "$vae_checkpoint" ] && [ -f "$vae_checkpoint" ]; then
