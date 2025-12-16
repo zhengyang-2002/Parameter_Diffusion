@@ -36,6 +36,7 @@ from torch.utils.data import Dataset, DataLoader, random_split
 import torchvision.transforms as transforms
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
+from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
 from tqdm import tqdm
 import yaml
 from einops import rearrange, repeat
@@ -149,18 +150,22 @@ class DiffusionDataset(Dataset):
             image_files = list(class_dir.glob("*.JPEG")) + \
                          list(class_dir.glob("*.jpg")) + \
                          list(class_dir.glob("*.png"))
+
+            if len(image_files) == 0:
+                all_class_samples.append(torch.zeros(self.num_samples, 3, self.image_size, self.image_size))
+                continue
             
             if len(image_files) < self.num_samples:
                 image_files = image_files * (self.num_samples // len(image_files) + 1)
             
             # Random sample
-            indices = torch.randperm(len(image_files))[:self.num_samples]
+            indices = torch.randperm(len(image_files))[:self.num_samples].tolist()
             
             class_samples = []
             for idx in indices:
                 try:
                     from PIL import Image
-                    img = Image.open(image_files[idx]).convert('RGB')
+                    img = Image.open(image_files[int(idx)]).convert('RGB')
                     img_tensor = self.transform(img)
                     class_samples.append(img_tensor)
                 except:
@@ -208,8 +213,16 @@ class VAEWrapper(nn.Module):
         from stage1.modules.distributions import DiagonalGaussianDistribution
         
         self.DiagonalGaussianDistribution = DiagonalGaussianDistribution
+
+        def _base_dir(p: str) -> Path:
+            pp = Path(p)
+            if pp.parent.name == "checkpoints":
+                return pp.parent.parent
+            return pp.parent
+
+        base_dir = _base_dir(vae_checkpoint)
         
-        # VAE config for ResNet18 heads (10 classes * 512 features + 10 bias = 5130)
+        # Default VAE config for ResNet18 heads (overridden by vae_config.yaml when present)
         ddconfig = {
             "double_z": True,
             "z_channels": 4,
@@ -223,8 +236,32 @@ class VAEWrapper(nn.Module):
             "attn_resolutions": [],
             "dropout": 0.0,
             "in_dim": 513,
-            "fdim": 2048
+            "fdim": 2048,
         }
+
+        cfg_path = base_dir / "vae_config.yaml"
+        if cfg_path.exists():
+            try:
+                cfg = yaml.safe_load(cfg_path.read_text())
+                if isinstance(cfg, dict) and "ddconfig" in cfg:
+                    ddconfig = cfg["ddconfig"]
+            except Exception:
+                pass
+
+        # Optional weight normalization (matches Step2)
+        self.weight_norm_method = "none"
+        self.weight_norm_eps = 1e-8
+        self.weight_mean_scale = 1.0
+        norm_path = base_dir / "weight_normalization.yaml"
+        if norm_path.exists():
+            try:
+                norm_cfg = yaml.safe_load(norm_path.read_text())
+                if isinstance(norm_cfg, dict):
+                    self.weight_norm_method = (norm_cfg.get("method") or "none").lower()
+                    self.weight_norm_eps = float(norm_cfg.get("eps") or 1e-8)
+                    self.weight_mean_scale = float(norm_cfg.get("mean_scale") or 1.0)
+            except Exception:
+                pass
         
         lossconfig = {
             "target": "stage1.modules.losses.CustomLosses.Myloss",
@@ -243,10 +280,13 @@ class VAEWrapper(nn.Module):
         # Load checkpoint
         if os.path.exists(vae_checkpoint):
             checkpoint = torch.load(vae_checkpoint, map_location='cpu')
-            if 'state_dict' in checkpoint:
-                self.vae.load_state_dict(checkpoint['state_dict'], strict=False)
+            state_dict = checkpoint['state_dict'] if isinstance(checkpoint, dict) and 'state_dict' in checkpoint else checkpoint
+            if isinstance(state_dict, dict) and any(k.startswith('vae.') for k in state_dict.keys()):
+                state_dict = {k[len('vae.'):]: v for k, v in state_dict.items() if k.startswith('vae.')}
+            if isinstance(state_dict, dict):
+                self.vae.load_state_dict(state_dict, strict=False)
             else:
-                self.vae.load_state_dict(checkpoint, strict=False)
+                raise ValueError(f"Unexpected checkpoint format at {vae_checkpoint}")
             print(f"Loaded VAE from {vae_checkpoint}")
         else:
             print(f"Warning: VAE checkpoint not found at {vae_checkpoint}")
@@ -256,17 +296,24 @@ class VAEWrapper(nn.Module):
         for param in self.vae.parameters():
             param.requires_grad = False
     
-    def encode(self, x):
-        """Encode weights to latent space."""
+    def encode(self, x, *, sample: bool = False):
+        """Encode weights to latent space.
+
+        By default we use the posterior mode for deterministic latents. Set sample=True
+        to sample from the posterior.
+        """
         out_device = x.device
         try:
             vae_device = next(self.vae.parameters()).device
         except StopIteration:
             vae_device = torch.device('cpu')
         x_in = x.detach().to(vae_device)
+        if self.weight_norm_method == "l2":
+            scale = torch.norm(x_in, dim=1, keepdim=True).clamp_min(self.weight_norm_eps)
+            x_in = x_in / scale
         with torch.no_grad():
             posterior = self.vae.encode(x_in)
-            z = posterior.sample()
+            z = posterior.sample() if sample else posterior.mode()
         return z.to(out_device)
     
     def decode(self, z):
@@ -279,6 +326,8 @@ class VAEWrapper(nn.Module):
         z_in = z.detach().to(vae_device)
         with torch.no_grad():
             x = self.vae.decode(z_in)
+        if self.weight_norm_method == "l2":
+            x = x * float(self.weight_mean_scale)
         return x.to(out_device)
 
 
@@ -345,6 +394,8 @@ class SimpleTaskEncoder(nn.Module):
         latent_channels: int = 4,
         latent_h: int = 16,
         latent_w: int = 16,
+        backbone: str = "small_cnn",
+        freeze_backbone: bool = True,
     ):
         super().__init__()
         
@@ -354,21 +405,40 @@ class SimpleTaskEncoder(nn.Module):
         self.latent_h = latent_h
         self.latent_w = latent_w
         
-        # Simple CNN to encode each image
-        self.image_encoder = nn.Sequential(
-            nn.Conv2d(3, 32, 3, stride=2, padding=1),  # 64->32
-            nn.ReLU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1),  # 32->16
-            nn.ReLU(),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),  # 16->8
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-        )
+        self.backbone = str(backbone)
+        self.freeze_backbone = bool(freeze_backbone)
+        self.image_size = int(image_size)
+
+        feature_dim: int
+        if self.backbone == "small_cnn":
+            # Simple CNN to encode each image
+            self.image_encoder = nn.Sequential(
+                nn.Conv2d(3, 32, 3, stride=2, padding=1),  # 64->32
+                nn.ReLU(),
+                nn.Conv2d(32, 64, 3, stride=2, padding=1),  # 32->16
+                nn.ReLU(),
+                nn.Conv2d(64, 128, 3, stride=2, padding=1),  # 16->8
+                nn.ReLU(),
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+            )
+            feature_dim = 128
+        elif self.backbone in {"resnet18_pretrained", "resnet18_random"}:
+            import torchvision.models as models
+            weights = models.ResNet18_Weights.IMAGENET1K_V1 if self.backbone == "resnet18_pretrained" else None
+            resnet = models.resnet18(weights=weights)
+            resnet.fc = nn.Identity()
+            self.image_encoder = resnet
+            feature_dim = 512
+            if self.freeze_backbone:
+                for p in self.image_encoder.parameters():
+                    p.requires_grad = False
+        else:
+            raise ValueError(f"Unknown task encoder backbone: {self.backbone}")
         
         # Aggregate samples
         self.sample_agg = nn.Sequential(
-            nn.Linear(128, embed_dim),
+            nn.Linear(feature_dim, embed_dim),
             nn.ReLU(),
         )
         
@@ -398,7 +468,12 @@ class SimpleTaskEncoder(nn.Module):
             
             # Encode all images
             x_flat = x.view(nc * ns, c, h, w)
-            img_features = self.image_encoder(x_flat)  # (nc*ns, 128)
+
+            # If using ResNet, resize to 224 for stable features
+            if self.backbone.startswith("resnet") and (h != 224 or w != 224):
+                x_flat = F.interpolate(x_flat, size=(224, 224), mode="bilinear", align_corners=False)
+
+            img_features = self.image_encoder(x_flat)  # (nc*ns, feat)
             img_features = img_features.view(nc, ns, -1)  # (nc, ns, 128)
             
             # Average pool over samples
@@ -632,6 +707,9 @@ class LatentDiffusionModule(pl.LightningModule):
         latent_channels: int = 4,
         latent_size: int = 16,
         latent_h: Optional[int] = None,
+        task_backbone: str = "small_cnn",
+        freeze_task_backbone: bool = True,
+        cond_std_loss_weight: float = 0.0,
         latent_w: Optional[int] = None,
         num_classes: int = 10,
         num_samples: int = 5,
@@ -655,6 +733,7 @@ class LatentDiffusionModule(pl.LightningModule):
         # Keep Lightning hparams in sync (useful for checkpoints/logs)
         self.hparams["latent_h"] = self.latent_h
         self.hparams["latent_w"] = self.latent_w
+        self.cond_std_loss_weight = float(cond_std_loss_weight)
 
         # VAE (for encoding/decoding weights)
         if vae_checkpoint and os.path.exists(vae_checkpoint):
@@ -703,6 +782,8 @@ class LatentDiffusionModule(pl.LightningModule):
             latent_channels=self.latent_channels,
             latent_h=self.latent_h,
             latent_w=self.latent_w,
+            backbone=task_backbone,
+            freeze_backbone=freeze_task_backbone,
         )
         
         # UNet
@@ -836,6 +917,16 @@ class LatentDiffusionModule(pl.LightningModule):
         
         # Compute loss
         loss = self.p_losses(z, t, cond)
+
+        # Optional anti-collapse regularizer: encourage non-trivial variation in cond across batch.
+        # This helps when the task encoder collapses to nearly-constant outputs.
+        if self.cond_std_loss_weight > 0 and cond.shape[0] > 1:
+            flat = cond.flatten(1)
+            std = flat.std(dim=0).mean()
+            penalty = 1.0 / (std + 1e-4)
+            loss = loss + self.cond_std_loss_weight * penalty
+            self.log('train/cond_std', std, prog_bar=False, sync_dist=True)
+            self.log('train/cond_std_penalty', penalty, prog_bar=False, sync_dist=True)
         
         return loss
     
@@ -962,24 +1053,34 @@ class DiffusionDataModule(pl.LightningDataModule):
         print(f"Dataset split: Train {train_size}, Val {val_size}")
     
     def train_dataloader(self):
+        dl_kwargs = {}
+        if self.hparams.num_workers and int(self.hparams.num_workers) > 0:
+            dl_kwargs["persistent_workers"] = True
+            dl_kwargs["prefetch_factor"] = 2
         return DataLoader(
             self.train_ds,
             batch_size=self.hparams.batch_size,
             shuffle=True,
             num_workers=self.hparams.num_workers,
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(),
             collate_fn=collate_fn,
-            drop_last=True
+            drop_last=True,
+            **dl_kwargs,
         )
     
     def val_dataloader(self):
+        dl_kwargs = {}
+        if self.hparams.num_workers and int(self.hparams.num_workers) > 0:
+            dl_kwargs["persistent_workers"] = True
+            dl_kwargs["prefetch_factor"] = 2
         return DataLoader(
             self.val_ds,
             batch_size=self.hparams.batch_size,
             shuffle=False,
             num_workers=self.hparams.num_workers,
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(),
             collate_fn=collate_fn,
+            **dl_kwargs,
         )
 
 
@@ -1020,6 +1121,26 @@ def main():
                         help="Optional latent height. If unset, defaults to --latent_size.")
     parser.add_argument("--latent_w", type=int, default=None,
                         help="Optional latent width. If unset, defaults to --latent_size.")
+
+    # Conditioning encoder params (Step 4)
+    parser.add_argument(
+        "--task_backbone",
+        type=str,
+        default="small_cnn",
+        choices=["small_cnn", "resnet18_pretrained", "resnet18_random"],
+        help="Backbone for the conditioning task encoder. Using resnet18_pretrained often prevents collapse.",
+    )
+    parser.add_argument(
+        "--freeze_task_backbone",
+        action="store_true",
+        help="Freeze the task backbone (recommended for resnet18_pretrained).",
+    )
+    parser.add_argument(
+        "--cond_std_loss_weight",
+        type=float,
+        default=0.0,
+        help="Optional regularizer weight to discourage collapsed (constant) conditioning; 0 disables.",
+    )
     
     # Training params
     parser.add_argument("--epochs", type=int, default=500)
@@ -1036,6 +1157,12 @@ def main():
     parser.add_argument("--devices", type=int, default=1)
     
     args = parser.parse_args()
+
+    if args.task_encoder_checkpoint:
+        print(
+            "[Info] --task_encoder_checkpoint was provided, but this implementation trains the conditioning encoder (SimpleTaskEncoder) jointly "
+            "with the diffusion model and does not load a separate Step 3 checkpoint. The argument will be ignored."
+        )
 
     if args.dry_run:
         # Force a tiny, fast run (mainly for verifying shapes + device wiring)
@@ -1105,6 +1232,9 @@ def main():
         latent_size=args.latent_size,
         latent_h=args.latent_h,
         latent_w=args.latent_w,
+        task_backbone=args.task_backbone,
+        freeze_task_backbone=args.freeze_task_backbone,
+        cond_std_loss_weight=args.cond_std_loss_weight,
         num_classes=args.num_classes,
         num_samples=args.num_samples,
     )
@@ -1130,6 +1260,14 @@ def main():
         ]
     
     # Trainer
+    logger = False
+    if not args.dry_run:
+        try:
+            import tensorboard  # noqa: F401
+            logger = TensorBoardLogger(save_dir=str(output_path))
+        except Exception:
+            logger = CSVLogger(save_dir=str(output_path))
+
     trainer = pl.Trainer(
         default_root_dir=output_path,
         max_epochs=args.epochs,
@@ -1139,7 +1277,7 @@ def main():
         log_every_n_steps=args.log_every_n_steps,
         gradient_clip_val=1.0,
         enable_checkpointing=(not args.dry_run),
-        logger=(False if args.dry_run else True),
+        logger=logger,
         limit_train_batches=(1 if args.dry_run else 1.0),
         limit_val_batches=(1 if args.dry_run else 1.0),
         num_sanity_val_steps=(0 if args.dry_run else 2),

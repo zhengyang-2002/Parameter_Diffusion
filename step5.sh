@@ -34,7 +34,10 @@ num_classes=10            # Number of classes
 output_file="./generated_weights.pth"
 
 # Device
-device="cuda"  # or "cpu"
+device="cuda"  # "cuda" | "mps" | "cpu"
+if [ "$(uname)" = "Darwin" ]; then
+    device="mps"
+fi
 
 # --- Execution ---
 echo "=============================================="
@@ -48,6 +51,13 @@ echo "  - Samples per class: $num_samples_per_class"
 echo "  - Number of weights to generate: $num_weights"
 echo "  - Output file: $output_file"
 echo ""
+
+# Resolve checkpoint if a directory is provided
+if [ -d "$diffusion_checkpoint" ]; then
+    if [ -f "$diffusion_checkpoint/checkpoints/last.ckpt" ]; then
+        diffusion_checkpoint="$diffusion_checkpoint/checkpoints/last.ckpt"
+    fi
+fi
 
 # Check if checkpoint exists
 if [ ! -f "$diffusion_checkpoint" ]; then

@@ -36,6 +36,7 @@ import torchvision.transforms as transforms
 from torchvision.datasets import ImageFolder
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
+from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
 from tqdm import tqdm
 import yaml
 from einops import rearrange
@@ -67,6 +68,7 @@ class WeightDatasetPairDataset(Dataset):
         num_classes: int = 10,
         image_size: int = 64,
         weight_target_size: int = 5130,  # 10 classes * 512 features + 10 bias
+        augment: bool = False,
     ):
         super().__init__()
         self.weights_dir = Path(weights_dir)
@@ -74,13 +76,23 @@ class WeightDatasetPairDataset(Dataset):
         self.num_samples = num_samples_per_class
         self.num_classes = num_classes
         self.weight_target_size = weight_target_size
+        self.image_size = image_size
         
         # Image transforms
-        self.transform = transforms.Compose([
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        ])
+        if augment:
+            self.transform = transforms.Compose([
+                transforms.RandomResizedCrop(image_size, scale=(0.7, 1.0)),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ])
+        else:
+            self.transform = transforms.Compose([
+                transforms.Resize((image_size, image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ])
         
         # Load mapping
         with open(mapping_file, 'r') as f:
@@ -146,24 +158,32 @@ class WeightDatasetPairDataset(Dataset):
             
             # Get image files
             image_files = list(class_dir.glob("*.JPEG")) + list(class_dir.glob("*.jpg")) + list(class_dir.glob("*.png"))
+
+            if len(image_files) == 0:
+                # If the directory is empty/mispointed, fall back to zeros to avoid crashing.
+                # (This should be rare for a correct TinyImageNet train directory.)
+                class_tensor = torch.zeros(self.num_samples, 3, self.image_size, self.image_size)
+                all_samples.append(class_tensor)
+                continue
             
             if len(image_files) < self.num_samples:
                 # Repeat if not enough samples
-                image_files = image_files * (self.num_samples // len(image_files) + 1)
+                repeats = (self.num_samples + len(image_files) - 1) // len(image_files)
+                image_files = image_files * repeats
             
             # Random sample
-            indices = torch.randperm(len(image_files))[:self.num_samples]
+            indices = torch.randperm(len(image_files))[:self.num_samples].tolist()
             
             class_samples = []
             for idx in indices:
                 try:
                     from PIL import Image
-                    img = Image.open(image_files[idx]).convert('RGB')
+                    img = Image.open(image_files[int(idx)]).convert('RGB')
                     img_tensor = self.transform(img)
                     class_samples.append(img_tensor)
                 except Exception as e:
                     # Use zeros as fallback
-                    class_samples.append(torch.zeros(3, 64, 64))
+                    class_samples.append(torch.zeros(3, self.image_size, self.image_size))
             
             # Stack samples for this class: (num_samples, 3, H, W)
             class_tensor = torch.stack(class_samples)
@@ -343,6 +363,76 @@ class SetTransformerEncoder(nn.Module):
         return self.proj(dataset_embedding)
 
 
+class MeanPoolDatasetEncoder(nn.Module):
+    """Simple dataset encoder: CNN per-image features + mean pool over samples/classes."""
+
+    def __init__(
+        self,
+        image_size: int = 64,
+        in_channels: int = 3,
+        feat_dim: int = 256,
+        output_dim: int = 1024,
+        num_classes: int = 10,
+        num_samples: int = 5,
+        backbone: str = "small_cnn",
+        freeze_backbone: bool = True,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.num_samples = num_samples
+        self.image_size = image_size
+        self.backbone = backbone
+
+        if backbone == "small_cnn":
+            # Small + stable (no BatchNorm; works better on small batches)
+            self.image_encoder = nn.Sequential(
+                nn.Conv2d(in_channels, 32, 3, stride=2, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, 3, stride=2, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(64, feat_dim, 3, stride=2, padding=1),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+            )
+            proj_in = feat_dim
+        elif backbone in {"resnet18_pretrained", "resnet18_random"}:
+            import torchvision.models as models
+            weights = None
+            if backbone == "resnet18_pretrained":
+                try:
+                    weights = models.ResNet18_Weights.IMAGENET1K_V1
+                except Exception:
+                    weights = None
+            net = models.resnet18(weights=weights)
+            net.fc = nn.Identity()  # 512-d
+            if freeze_backbone:
+                for p in net.parameters():
+                    p.requires_grad = False
+            self.image_encoder = net
+            proj_in = 512
+        else:
+            raise ValueError(f"Unknown backbone: {backbone}")
+
+        self.proj = nn.Sequential(
+            nn.Linear(proj_in, output_dim),
+            nn.ReLU(),
+            nn.Linear(output_dim, output_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (batch, num_classes, num_samples, 3, H, W) -> (batch, output_dim)"""
+        b, nc, ns, c, h, w = x.shape
+        x_flat = x.view(b * nc * ns, c, h, w)
+        if self.backbone.startswith("resnet18"):
+            # ResNet expects ~224x224; upsample on the fly.
+            x_flat = F.interpolate(x_flat, size=(224, 224), mode="bilinear", align_corners=False)
+        feats = self.image_encoder(x_flat).view(b, nc, ns, -1)
+        feats = feats.mean(dim=2)  # mean over samples -> (b, nc, feat_dim)
+        feats = feats.mean(dim=1)  # mean over classes -> (b, feat_dim)
+        return self.proj(feats)
+
+
 # ==============================================================================
 # Weight Encoder (frozen VAE encoder from Step 2)
 # ==============================================================================
@@ -382,9 +472,14 @@ class TaskEncoderModule(pl.LightningModule):
     def __init__(
         self,
         embed_dim: int = 1024,
+        dataset_encoder_type: str = "set_transformer",
+        dataset_backbone: str = "small_cnn",
+        freeze_backbone: bool = True,
         temperature: float = 0.07,
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-5,
+        proj_dropout: float = 0.0,
+        label_smoothing: float = 0.0,
         image_size: int = 64,
         num_classes: int = 10,
         num_samples: int = 5,
@@ -398,16 +493,32 @@ class TaskEncoderModule(pl.LightningModule):
         self.temperature = temperature
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
+        self.proj_dropout = float(proj_dropout)
+        self.label_smoothing = float(label_smoothing)
+        self._weight_norm_method = "none"
+        self._weight_norm_eps = 1e-8
         
         # Dataset encoder (Task Encoder)
-        self.dataset_encoder = SetTransformerEncoder(
-            image_size=image_size,
-            embed_dim=256,
-            hidden_dim=512,
-            output_dim=embed_dim,
-            num_classes=num_classes,
-            num_samples=num_samples,
-        )
+        if dataset_encoder_type == "set_transformer":
+            self.dataset_encoder = SetTransformerEncoder(
+                image_size=image_size,
+                embed_dim=256,
+                hidden_dim=512,
+                output_dim=embed_dim,
+                num_classes=num_classes,
+                num_samples=num_samples,
+            )
+        elif dataset_encoder_type == "mean_pool":
+            self.dataset_encoder = MeanPoolDatasetEncoder(
+                image_size=image_size,
+                output_dim=embed_dim,
+                num_classes=num_classes,
+                num_samples=num_samples,
+                backbone=dataset_backbone,
+                freeze_backbone=freeze_backbone,
+            )
+        else:
+            raise ValueError(f"Unknown dataset_encoder_type: {dataset_encoder_type}")
         
         # Weight encoder
         if vae_checkpoint and dnnwg_path and os.path.exists(vae_checkpoint):
@@ -427,12 +538,14 @@ class TaskEncoderModule(pl.LightningModule):
         self.weight_proj = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.ReLU(),
+            nn.Dropout(self.proj_dropout) if self.proj_dropout > 0 else nn.Identity(),
             nn.Linear(embed_dim, embed_dim)
         )
         
         self.dataset_proj = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.ReLU(),
+            nn.Dropout(self.proj_dropout) if self.proj_dropout > 0 else nn.Identity(),
             nn.Linear(embed_dim, embed_dim)
         )
     
@@ -440,8 +553,9 @@ class TaskEncoderModule(pl.LightningModule):
         """Load the encoder part of a trained VAE."""
         sys.path.insert(0, dnnwg_path)
         from stage1.models.autoencoder import VAENoDiscModel
+        from pathlib import Path
         
-        # Load config (you may need to adjust this based on your VAE)
+        # Default config (used unless we can load `vae_config.yaml`)
         ddconfig = {
             "double_z": True,
             "z_channels": 4,
@@ -455,13 +569,36 @@ class TaskEncoderModule(pl.LightningModule):
             "attn_resolutions": [],
             "dropout": 0.0,
             "in_dim": 513,
-            "fdim": 2048
+            "fdim": 2048,
         }
         
         lossconfig = {
             "target": "stage1.modules.losses.CustomLosses.Myloss",
             "params": {"logvar_init": 0.0, "kl_weight": 1e-6}
         }
+
+        # If this checkpoint comes from our Step2 script, prefer its saved config.
+        ckpt = Path(ckpt_path)
+        base_dir = ckpt.parent.parent if ckpt.parent.name == "checkpoints" else ckpt.parent
+        cfg_path = base_dir / "vae_config.yaml"
+        if cfg_path.exists():
+            try:
+                cfg = yaml.safe_load(cfg_path.read_text())
+                if isinstance(cfg, dict) and "ddconfig" in cfg:
+                    ddconfig = cfg["ddconfig"]
+            except Exception:
+                pass
+        
+        # Weight normalization config (optional)
+        norm_path = base_dir / "weight_normalization.yaml"
+        if norm_path.exists():
+            try:
+                norm_cfg = yaml.safe_load(norm_path.read_text())
+                if isinstance(norm_cfg, dict):
+                    self._weight_norm_method = (norm_cfg.get("method") or "none").lower()
+                    self._weight_norm_eps = float(norm_cfg.get("eps") or 1e-8)
+            except Exception:
+                pass
         
         # Create and load model
         vae = VAENoDiscModel(
@@ -473,10 +610,13 @@ class TaskEncoderModule(pl.LightningModule):
         )
         
         checkpoint = torch.load(ckpt_path, map_location='cpu')
-        if 'state_dict' in checkpoint:
-            vae.load_state_dict(checkpoint['state_dict'], strict=False)
+        state_dict = checkpoint['state_dict'] if isinstance(checkpoint, dict) and 'state_dict' in checkpoint else checkpoint
+        if isinstance(state_dict, dict) and any(k.startswith('vae.') for k in state_dict.keys()):
+            state_dict = {k[len('vae.'):]: v for k, v in state_dict.items() if k.startswith('vae.')}
+        if isinstance(state_dict, dict):
+            vae.load_state_dict(state_dict, strict=False)
         else:
-            vae.load_state_dict(checkpoint, strict=False)
+            raise ValueError(f"Unexpected checkpoint format at {ckpt_path}")
         
         # Freeze encoder
         for param in vae.encoder.parameters():
@@ -488,6 +628,9 @@ class TaskEncoderModule(pl.LightningModule):
     
     def encode_weights(self, weights):
         """Encode weights to embedding space."""
+        if self._weight_norm_method == "l2":
+            scale = torch.norm(weights, dim=1, keepdim=True).clamp_min(self._weight_norm_eps)
+            weights = weights / scale
         if self.use_vae:
             # VAE encoder expects (batch, channels, dim)
             batch_size = weights.shape[0]
@@ -525,24 +668,58 @@ class TaskEncoderModule(pl.LightningModule):
         labels = torch.arange(batch_size, device=self.device)
         
         # Cross-entropy loss in both directions
-        loss_w2d = F.cross_entropy(logits, labels)
-        loss_d2w = F.cross_entropy(logits.T, labels)
+        loss_w2d = F.cross_entropy(logits, labels, label_smoothing=self.label_smoothing)
+        loss_d2w = F.cross_entropy(logits.T, labels, label_smoothing=self.label_smoothing)
         
         return (loss_w2d + loss_d2w) / 2
+
+    @staticmethod
+    def _retrieval_metrics(sim: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Compute batch retrieval metrics from a similarity matrix.
+
+        This is *not* classification accuracy. It measures whether the highest-similarity
+        dataset embedding for each weight embedding is its paired item in the batch.
+        Random baseline for acc@1 is ~1/B.
+        """
+        b = sim.shape[0]
+        labels = torch.arange(b, device=sim.device)
+
+        preds1 = sim.argmax(dim=1)
+        acc1 = (preds1 == labels).float().mean()
+
+        k = min(5, b)
+        topk = sim.topk(k=k, dim=1).indices
+        acc5 = (topk == labels.unsqueeze(1)).any(dim=1).float().mean()
+
+        diag_mean = sim.diag().mean()
+        if b > 1:
+            offdiag_mean = (sim.sum() - sim.diag().sum()) / (b * b - b)
+        else:
+            offdiag_mean = torch.tensor(float("nan"), device=sim.device)
+
+        return {
+            "acc@1": acc1,
+            "acc@5": acc5,
+            "diag_sim": diag_mean,
+            "offdiag_sim": offdiag_mean,
+        }
     
     def training_step(self, batch, batch_idx):
         weight_embeds, dataset_embeds = self(batch)
         loss = self.contrastive_loss(weight_embeds, dataset_embeds)
         
-        # Compute accuracy
+        # Retrieval metrics (random acc@1 baseline is ~1/B)
         with torch.no_grad():
-            logits = weight_embeds @ dataset_embeds.T
-            preds = logits.argmax(dim=1)
-            labels = torch.arange(weight_embeds.shape[0], device=self.device)
-            acc = (preds == labels).float().mean()
+            sim = weight_embeds @ dataset_embeds.T
+            m = self._retrieval_metrics(sim)
         
         self.log('train/loss', loss, prog_bar=True, sync_dist=True)
-        self.log('train/acc', acc, prog_bar=True, sync_dist=True)
+        # Keep legacy key for compatibility; also log clearer names.
+        self.log('train/acc', m["acc@1"], prog_bar=True, sync_dist=True)
+        self.log('train/retrieval_acc@1', m["acc@1"], prog_bar=True, sync_dist=True)
+        self.log('train/retrieval_acc@5', m["acc@5"], prog_bar=False, sync_dist=True)
+        self.log('train/diag_sim', m["diag_sim"], prog_bar=False, sync_dist=True)
+        self.log('train/offdiag_sim', m["offdiag_sim"], prog_bar=False, sync_dist=True)
         
         return loss
     
@@ -551,13 +728,15 @@ class TaskEncoderModule(pl.LightningModule):
         loss = self.contrastive_loss(weight_embeds, dataset_embeds)
         
         with torch.no_grad():
-            logits = weight_embeds @ dataset_embeds.T
-            preds = logits.argmax(dim=1)
-            labels = torch.arange(weight_embeds.shape[0], device=self.device)
-            acc = (preds == labels).float().mean()
+            sim = weight_embeds @ dataset_embeds.T
+            m = self._retrieval_metrics(sim)
         
         self.log('val/loss', loss, prog_bar=True, sync_dist=True)
-        self.log('val/acc', acc, prog_bar=True, sync_dist=True)
+        self.log('val/acc', m["acc@1"], prog_bar=True, sync_dist=True)
+        self.log('val/retrieval_acc@1', m["acc@1"], prog_bar=True, sync_dist=True)
+        self.log('val/retrieval_acc@5', m["acc@5"], prog_bar=False, sync_dist=True)
+        self.log('val/diag_sim', m["diag_sim"], prog_bar=False, sync_dist=True)
+        self.log('val/offdiag_sim', m["offdiag_sim"], prog_bar=False, sync_dist=True)
         
         return loss
     
@@ -607,6 +786,7 @@ class TaskEncoderDataModule(pl.LightningDataModule):
         batch_size: int = 16,
         num_workers: int = 4,
         val_split: float = 0.1,
+        augment: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -619,10 +799,15 @@ class TaskEncoderDataModule(pl.LightningDataModule):
             num_subsets=self.hparams.num_subsets,
             num_samples_per_class=self.hparams.num_samples_per_class,
             num_classes=self.hparams.num_classes,
+            augment=bool(self.hparams.augment),
         )
-        
-        val_size = int(len(full_dataset) * self.hparams.val_split)
-        train_size = len(full_dataset) - val_size
+
+        n = len(full_dataset)
+        val_size = int(n * self.hparams.val_split)
+        if self.hparams.val_split and float(self.hparams.val_split) > 0 and n >= 2:
+            val_size = max(1, val_size)
+            val_size = min(val_size, n - 1)
+        train_size = n - val_size
         
         self.train_ds, self.val_ds = random_split(
             full_dataset,
@@ -633,22 +818,32 @@ class TaskEncoderDataModule(pl.LightningDataModule):
         print(f"Dataset split: Train {train_size}, Val {val_size}")
     
     def train_dataloader(self):
+        dl_kwargs = {}
+        if self.hparams.num_workers and int(self.hparams.num_workers) > 0:
+            dl_kwargs["persistent_workers"] = True
+            dl_kwargs["prefetch_factor"] = 2
         return DataLoader(
             self.train_ds,
             batch_size=self.hparams.batch_size,
             shuffle=True,
             num_workers=self.hparams.num_workers,
-            pin_memory=True,
-            drop_last=True
+            pin_memory=torch.cuda.is_available(),
+            drop_last=True,
+            **dl_kwargs,
         )
     
     def val_dataloader(self):
+        dl_kwargs = {}
+        if self.hparams.num_workers and int(self.hparams.num_workers) > 0:
+            dl_kwargs["persistent_workers"] = True
+            dl_kwargs["prefetch_factor"] = 2
         return DataLoader(
             self.val_ds,
             batch_size=self.hparams.batch_size,
             shuffle=False,
             num_workers=self.hparams.num_workers,
-            pin_memory=True
+            pin_memory=torch.cuda.is_available(),
+            **dl_kwargs,
         )
 
 
@@ -678,8 +873,31 @@ def main():
                         help="Number of classes per subset")
     parser.add_argument("--num_samples", type=int, default=5,
                         help="Number of sample images per class")
+    parser.add_argument("--augment", action="store_true",
+                        help="Enable random image augmentation for Step 3")
     parser.add_argument("--val_split", type=float, default=0.1,
                         help="Validation split ratio")
+
+    parser.add_argument(
+        "--dataset_encoder",
+        type=str,
+        default="set_transformer",
+        choices=["set_transformer", "mean_pool"],
+        help="Dataset encoder architecture for Step 3",
+    )
+
+    parser.add_argument(
+        "--dataset_backbone",
+        type=str,
+        default="small_cnn",
+        choices=["small_cnn", "resnet18_pretrained", "resnet18_random"],
+        help="Backbone used when --dataset_encoder=mean_pool",
+    )
+    parser.add_argument(
+        "--freeze_backbone",
+        action="store_true",
+        help="Freeze backbone weights when using a ResNet backbone",
+    )
     
     # Training params
     parser.add_argument("--epochs", type=int, default=100,
@@ -688,16 +906,34 @@ def main():
                         help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-4,
                         help="Learning rate")
+    parser.add_argument("--weight_decay", type=float, default=1e-4,
+                        help="AdamW weight decay (regularization)")
     parser.add_argument("--embed_dim", type=int, default=1024,
                         help="Embedding dimension")
     parser.add_argument("--temperature", type=float, default=0.07,
                         help="Contrastive loss temperature")
+    parser.add_argument("--proj_dropout", type=float, default=0.1,
+                        help="Dropout probability inside projection heads")
+    parser.add_argument("--label_smoothing", type=float, default=0.0,
+                        help="Label smoothing for contrastive CE loss")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="Number of dataloader workers")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
     parser.add_argument("--gpus", type=int, default=1,
                         help="Number of GPUs to use")
+
+    parser.add_argument(
+        "--disable_early_stopping",
+        action="store_true",
+        help="Disable EarlyStopping so training always runs full --epochs",
+    )
+    parser.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=20,
+        help="EarlyStopping patience (when enabled)",
+    )
 
     # Device control (macOS/MPS friendly)
     parser.add_argument(
@@ -753,13 +989,20 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         val_split=args.val_split,
+        augment=bool(args.augment),
     )
     
     # Model
     model = TaskEncoderModule(
         embed_dim=args.embed_dim,
+        dataset_encoder_type=args.dataset_encoder,
+        dataset_backbone=args.dataset_backbone,
+        freeze_backbone=args.freeze_backbone,
         temperature=args.temperature,
         learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        proj_dropout=args.proj_dropout,
+        label_smoothing=args.label_smoothing,
         image_size=64,
         num_classes=args.num_classes,
         num_samples=args.num_samples,
@@ -777,13 +1020,18 @@ def main():
             save_top_k=3,
             save_last=True
         ),
-        EarlyStopping(
-            monitor='val/loss',
-            patience=20,
-            mode='min'
-        ),
         LearningRateMonitor(logging_interval='epoch')
     ]
+
+    if not args.disable_early_stopping:
+        callbacks.insert(
+            1,
+            EarlyStopping(
+                monitor='val/loss',
+                patience=int(args.early_stopping_patience),
+                mode='min'
+            ),
+        )
 
     if args.accelerator is not None:
         accelerator = args.accelerator
@@ -792,6 +1040,13 @@ def main():
         accelerator = 'cuda' if args.gpus > 0 and torch.cuda.is_available() else 'cpu'
         devices = args.gpus if args.gpus > 0 else 1
     
+    # Logger (prefer TensorBoard if installed; otherwise CSV)
+    try:
+        import tensorboard  # noqa: F401
+        logger = TensorBoardLogger(save_dir=str(output_path))
+    except Exception:
+        logger = CSVLogger(save_dir=str(output_path))
+
     # Trainer
     trainer = pl.Trainer(
         default_root_dir=output_path,
@@ -799,6 +1054,7 @@ def main():
         accelerator=accelerator,
         devices=devices,
         callbacks=callbacks,
+        logger=logger,
         log_every_n_steps=10,
         gradient_clip_val=1.0,
     )

@@ -57,6 +57,9 @@ def load_images_from_dir(
     image_files = list(image_dir.glob("*.jpg")) + \
                   list(image_dir.glob("*.JPEG")) + \
                   list(image_dir.glob("*.png"))
+
+    if len(image_files) == 0:
+        return torch.zeros(num_samples, 3, image_size, image_size)
     
     if len(image_files) < num_samples:
         image_files = image_files * (num_samples // len(image_files) + 1)
@@ -109,17 +112,22 @@ def load_tinyimagenet_classes(
         image_files = list(class_dir.glob("*.JPEG")) + \
                      list(class_dir.glob("*.jpg")) + \
                      list(class_dir.glob("*.png"))
+
+        if len(image_files) == 0:
+            print(f"Warning: No images found in: {class_dir}")
+            all_class_samples.append(torch.zeros(num_samples, 3, image_size, image_size))
+            continue
         
         if len(image_files) < num_samples:
             image_files = image_files * (num_samples // len(image_files) + 1)
         
         # Random sample
-        indices = torch.randperm(len(image_files))[:num_samples]
+        indices = torch.randperm(len(image_files))[:num_samples].tolist()
         
         class_images = []
         for idx in indices:
             try:
-                img = Image.open(image_files[idx]).convert('RGB')
+                img = Image.open(image_files[int(idx)]).convert('RGB')
                 img_tensor = transform(img)
                 class_images.append(img_tensor)
             except:
@@ -208,15 +216,42 @@ def main():
                         help="Device to use (cuda or cpu)")
     
     args = parser.parse_args()
-    
-    device = args.device if torch.cuda.is_available() else 'cpu'
+
+    # Resolve device preference (supports cuda/mps/cpu)
+    requested = (args.device or "").lower()
+    if requested == "cuda" and torch.cuda.is_available():
+        device = "cuda"
+    elif requested == "mps" and getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        device = "mps"
+    elif requested == "cpu":
+        device = "cpu"
+    else:
+        # Auto-select best available if request isn't usable
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+        if requested and requested != device:
+            print(f"Warning: requested device '{requested}' not available; using '{device}'.")
+
     print(f"Using device: {device}")
     
     # Load model
-    print(f"Loading diffusion model from {args.diffusion_checkpoint}...")
+    # Accept either a direct ckpt path, or an output dir containing checkpoints/last.ckpt
+    ckpt_path = Path(args.diffusion_checkpoint)
+    if ckpt_path.is_dir():
+        candidate = ckpt_path / "checkpoints" / "last.ckpt"
+        if candidate.exists():
+            ckpt_path = candidate
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Diffusion checkpoint not found: {ckpt_path}")
+
+    print(f"Loading diffusion model from {ckpt_path}...")
     
     model = LatentDiffusionModule.load_from_checkpoint(
-        args.diffusion_checkpoint,
+        str(ckpt_path),
         map_location=device
     )
     model = model.to(device)

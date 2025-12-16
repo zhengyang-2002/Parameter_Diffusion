@@ -35,11 +35,23 @@ tiny-imagenet-data/
 Model_Zoo/
 Pretrained_Components/
 
+# Local datasets / caches
+data/
+
+# Outputs
+results/
+
 # Checkpoints
 *.ckpt
 *.pth
 checkpoints/
 components/
+
+# Local scratch / tmp
+_tmp*/
+_tmp_*/
+step2_sanity.sh
+test.ipynb
 
 # Logs
 logs/

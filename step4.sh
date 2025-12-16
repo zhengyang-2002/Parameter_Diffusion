@@ -27,8 +27,8 @@
 # Quick sanity toggle:
 # - 1: fast smoke test (prints progress quickly, exits)
 # - 0: full training
-dry_run=0
-log_every_n_steps=1
+dry_run=${dry_run:-0}
+log_every_n_steps=${log_every_n_steps:-1}
 
 # Path to trained classifier heads from Step 1
 weights_dir="./Model_Zoo/Resnet18_TinyImageNet_HC"
@@ -39,12 +39,11 @@ tinyimagenet_dir="./tiny-imagenet-data/tiny-imagenet-200"
 # (Optional) VAE checkpoint from Step 2
 # If not provided, a simple VAE will be trained jointly
 # vae_checkpoint=""
-vae_checkpoint="./Pretrained_Components/VAE"
+vae_checkpoint="./components/resnet18_TinyImagenet_HC_VAE_l2"
 
 # (Optional) Task Encoder checkpoint from Step 3
 # If not provided, task encoder is trained jointly with diffusion
-task_encoder_checkpoint="/Users/supawich/Documents/Duke/Term1/PracticalML/Parameter_Diffusion/components/task_encoder/checkpoints/task_encoder-epoch=10-val/loss=2.6895.ckpt"
-# task_encoder_checkpoint="./components/task_encoder/checkpoints/last.ckpt"
+task_encoder_checkpoint=""
 
 # Path to DNNWG library
 dnnwg_path="./External/DNNWG"
@@ -69,6 +68,12 @@ batch_size=8             # Batch size (optimized for M4 Pro, increase to 16 if m
 lr=0.0001                # Learning rate
 num_workers=2            # DataLoader workers (lower for macOS)
 seed=42                  # Random seed
+
+# Conditioning encoder params (important for generalization)
+# The default small CNN tends to collapse to near-constant conditions; resnet18_pretrained is far more stable.
+task_backbone="resnet18_pretrained"   # small_cnn | resnet18_pretrained | resnet18_random
+freeze_task_backbone=1                # 1 freezes backbone weights
+cond_std_loss_weight=0.01             # 0 disables; small positive discourages collapsed (constant) conditioning
 
 # Device configuration
 # For Apple Silicon (M1/M2/M3/M4), we use MPS backend
@@ -130,6 +135,8 @@ echo "  - Epochs: $epochs"
 echo "  - Batch size: $batch_size"
 echo "  - Learning rate: $lr"
 echo "  - Accelerator: $accelerator"
+echo "  - Task backbone: $task_backbone (freeze=$freeze_task_backbone)"
+echo "  - cond_std_loss_weight: $cond_std_loss_weight"
 echo ""
 
 # Build command
@@ -153,15 +160,35 @@ cmd="python train_diffusion.py \
     --log_every_n_steps $log_every_n_steps \
     --accelerator $accelerator \
     --devices $devices \
-    --val_split $val_split"
+    --val_split $val_split \
+    --task_backbone $task_backbone \
+    --cond_std_loss_weight $cond_std_loss_weight"
+
+if [ "$freeze_task_backbone" -eq 1 ]; then
+    cmd="$cmd --freeze_task_backbone"
+fi
 
 if [ "$dry_run" -eq 1 ]; then
     cmd="$cmd --dry_run"
 fi
 
 # Add VAE checkpoint if specified
-if [ -n "$vae_checkpoint" ] && [ -f "$vae_checkpoint" ]; then
-    cmd="$cmd --vae_checkpoint \"$vae_checkpoint\""
+vae_ckpt_to_use=""
+if [ -n "$vae_checkpoint" ]; then
+    if [ -f "$vae_checkpoint" ]; then
+        vae_ckpt_to_use="$vae_checkpoint"
+    elif [ -d "$vae_checkpoint" ]; then
+        newest_last=$(ls -t "$vae_checkpoint"/checkpoints/last-v*.ckpt 2>/dev/null | head -n 1)
+        if [ -n "$newest_last" ] && [ -f "$newest_last" ]; then
+            vae_ckpt_to_use="$newest_last"
+        elif [ -f "$vae_checkpoint/checkpoints/last.ckpt" ]; then
+            vae_ckpt_to_use="$vae_checkpoint/checkpoints/last.ckpt"
+        fi
+    fi
+fi
+
+if [ -n "$vae_ckpt_to_use" ]; then
+    cmd="$cmd --vae_checkpoint \"$vae_ckpt_to_use\""
 fi
 
 # Add Task Encoder checkpoint if specified

@@ -30,8 +30,9 @@ tinyimagenet_dir="./tiny-imagenet-data/tiny-imagenet-200"
 output_dir="./components/task_encoder"
 
 # (Optional) VAE checkpoint from Step 2 - set to empty string to use simple encoder
+# Can be either a checkpoint file, or a directory containing checkpoints/last.ckpt
 # vae_checkpoint=""
-vae_checkpoint="./Pretrained_Components/VAE"
+vae_checkpoint="./components/resnet18_TinyImagenet_HC_VAE_l2"
 
 # Path to DNNWG library
 dnnwg_path="./External/DNNWG"
@@ -42,10 +43,13 @@ num_classes=10           # Number of classes per subset
 num_samples=5            # Sample images per class for encoding
 epochs=100               # Training epochs
 batch_size=16            # Batch size (reduce if OOM)
-lr=0.0001                # Learning rate
-embed_dim=1024           # Embedding dimension
+lr=0.001                # Learning rate
+weight_decay=0.0001      # Weight decay (regularization)
+proj_dropout=0.1         # Dropout in projection heads
+label_smoothing=0.05     # Contrastive label smoothing
+embed_dim=1024            # Embedding dimension (smaller = less overfit)
 temperature=0.07         # Contrastive loss temperature
-num_workers=4            # DataLoader workers
+num_workers=0            # DataLoader workers
 seed=42                  # Random seed
 gpus=0                   # Keep 0 on macOS; use --accelerator mps below
 
@@ -53,7 +57,7 @@ gpus=0                   # Keep 0 on macOS; use --accelerator mps below
 accelerator="mps"
 devices=1
 
-val_split=0.1            # Validation split ratio
+val_split=0.2            # Validation split ratio
 
 # --- Download TinyImageNet if needed ---
 if [ ! -d "$tinyimagenet_dir" ]; then
@@ -99,6 +103,11 @@ cmd="python train_task_encoder.py \
     --weights_dir \"$weights_dir\" \
     --tinyimagenet_dir \"$tinyimagenet_dir\" \
     --output_dir \"$output_dir\" \
+    --dataset_encoder mean_pool \
+    --dataset_backbone resnet18_pretrained \
+    --freeze_backbone \
+    --disable_early_stopping \
+    --augment \
     --dnnwg_path \"$dnnwg_path\" \
     --num_subsets $num_subsets \
     --num_classes $num_classes \
@@ -106,8 +115,11 @@ cmd="python train_task_encoder.py \
     --epochs $epochs \
     --batch_size $batch_size \
     --lr $lr \
+    --weight_decay $weight_decay \
     --embed_dim $embed_dim \
     --temperature $temperature \
+    --proj_dropout $proj_dropout \
+    --label_smoothing $label_smoothing \
     --num_workers $num_workers \
     --seed $seed \
     --gpus $gpus \
@@ -116,8 +128,23 @@ cmd="python train_task_encoder.py \
     --val_split $val_split"
 
 # Add VAE checkpoint if specified
-if [ -n "$vae_checkpoint" ] && [ -f "$vae_checkpoint" ]; then
-    cmd="$cmd --vae_checkpoint \"$vae_checkpoint\""
+vae_ckpt_to_use=""
+if [ -n "$vae_checkpoint" ]; then
+    if [ -f "$vae_checkpoint" ]; then
+        vae_ckpt_to_use="$vae_checkpoint"
+    elif [ -d "$vae_checkpoint" ]; then
+        # Prefer the newest versioned last checkpoint if present (Lightning can create last-v1.ckpt, last-v2.ckpt, ...)
+        newest_last=$(ls -t "$vae_checkpoint"/checkpoints/last-v*.ckpt 2>/dev/null | head -n 1)
+        if [ -n "$newest_last" ] && [ -f "$newest_last" ]; then
+            vae_ckpt_to_use="$newest_last"
+        elif [ -f "$vae_checkpoint/checkpoints/last.ckpt" ]; then
+            vae_ckpt_to_use="$vae_checkpoint/checkpoints/last.ckpt"
+        fi
+    fi
+fi
+
+if [ -n "$vae_ckpt_to_use" ]; then
+    cmd="$cmd --vae_checkpoint \"$vae_ckpt_to_use\""
 fi
 
 echo "Running command:"
