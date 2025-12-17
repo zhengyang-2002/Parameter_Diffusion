@@ -1,17 +1,13 @@
 #!/bin/bash
 source ./global_config.sh
 
-# --- 本步骤独立的训练超参数 ---
+# --- 独立训练参数 ---
 current_epochs=100
 current_batch_size=16
 current_lr=0.0000045
 num_workers=4
-gpus=1
 
-# --- 执行 ---
-echo "Step 2: 训练 VAE Weight Encoder"
-echo "  - Input Weights: $DIR_MODEL_ZOO"
-echo "  - Output VAE:    $DIR_VAE_OUTPUT"
+echo "Step 2: 训练 VAE (Device: $GLOBAL_DEVICE)"
 
 python train_vae_weight_encoder.py \
     --dnnwg_path "$GLOBAL_DNNWG_PATH" \
@@ -25,4 +21,4 @@ python train_vae_weight_encoder.py \
     --val_split $GLOBAL_VAL_SPLIT \
     --num_workers $num_workers \
     --seed $GLOBAL_SEED \
-    --gpus $gpus
+    --gpus $USE_GPU_FLAG
