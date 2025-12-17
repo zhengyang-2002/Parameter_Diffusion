@@ -1,44 +1,28 @@
 #!/bin/bash
+source ./global_config.sh
 
-# --- 实验配置 ---
-# DNNWG 库的绝对路径 (请根据实际情况修改)
-dnnwg_path="/root/External/DNNWG"
-
-# 上一阶段生成的权重目录
-weights_source_dir="./model_zoo/TinyImagenet_Resnet18"
-
-# VAE 输出目录
-output_dir="./components/resnet18_TinyImagenet_HC_VAE"
-
-# 训练参数
-num_subsets=500       # 需要与上一阶段生成的子集数量一致
-num_classes=10        # 每个子集的类别数
-epochs=100
-batch_size=16
-lr=0.0000045          # 4.5e-6
+# --- 本步骤独立的训练超参数 ---
+current_epochs=100
+current_batch_size=16
+current_lr=0.0000045
 num_workers=4
-seed=42
-val_split=0.1
-gpus=1                # 使用的GPU数量
+gpus=1
 
 # --- 执行 ---
-echo "开始执行 train_vae_weight_encoder.py"
-echo "-- 加载DNNWG库: $dnnwg_path"
-echo "-- 设定随机种子为 $seed"
-echo "-- 从 $weights_source_dir 读取 $num_subsets 个子集的 ResNet18 分类头权重"
-echo "-- 训练 VAE 模型: Batch=$batch_size, LR=$lr, Epochs=$epochs, Val Split=$val_split"
-echo "-- 目标输出目录: $output_dir"
+echo "Step 2: 训练 VAE Weight Encoder"
+echo "  - Input Weights: $DIR_MODEL_ZOO"
+echo "  - Output VAE:    $DIR_VAE_OUTPUT"
 
 python train_vae_weight_encoder.py \
-    --dnnwg_path "$dnnwg_path" \
-    --weights_dir "$weights_source_dir" \
-    --output_dir "$output_dir" \
-    --num_subsets $num_subsets \
-    --num_classes $num_classes \
-    --epochs $epochs \
-    --batch_size $batch_size \
-    --lr $lr \
-    --val_split $val_split \
+    --dnnwg_path "$GLOBAL_DNNWG_PATH" \
+    --weights_dir "$DIR_MODEL_ZOO" \
+    --output_dir "$DIR_VAE_OUTPUT" \
+    --num_subsets $GLOBAL_NUM_SUBSETS \
+    --num_classes $GLOBAL_NUM_CLASSES \
+    --epochs $current_epochs \
+    --batch_size $current_batch_size \
+    --lr $current_lr \
+    --val_split $GLOBAL_VAL_SPLIT \
     --num_workers $num_workers \
-    --seed $seed \
+    --seed $GLOBAL_SEED \
     --gpus $gpus

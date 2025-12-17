@@ -1,33 +1,27 @@
 #!/bin/bash
+source ./global_config.sh
 
-# --- 实验配置 ---
-num_subsets=500
-classes_per_subset=10
-epochs=10 
-batch_size=64 
-lr=0.001 
+# --- 本步骤独立的训练超参数 (Independent Hyperparameters) ---
+# 这些参数只影响当前步骤的训练效果，不需要与其他步骤一致
+current_epochs=10 
+current_batch_size=64 
+current_lr=0.001 
 num_workers=8 
-data_dir="./tiny-imagenet-dataset"
-output_dir="./model_zoo/TinyImagenet_Resnet18"
-seed=42
-val_split=0.1
 
 # --- 执行 ---
-echo "开始执行train_model_zoo.py"
-echo "-- 设定随机种子为$seed"
-echo "-- 下载并解压TinyImageNet数据集，使用$num_workers进行并行，在$data_dir中完成"
-echo "-- 随机划分数据集，number of subset = $num_subsets, classes per subset = $classes_per_subset"
-echo "-- 使用subsets只训练Resnet18的Classified Head，使用lr=$lr共训练$epochs个epochs，验证集比例为$val_split"
-echo "-- 将训练完成的Classified Head存储至$output_dir"
+echo "Step 1: 生成 Model Zoo"
+echo "  - Subsets: $GLOBAL_NUM_SUBSETS"
+echo "  - Classes: $GLOBAL_NUM_CLASSES"
+echo "  - Output:  $DIR_MODEL_ZOO"
 
 python train_model_zoo.py \
-    --num_subsets $num_subsets \
-    --classes_per_subset $classes_per_subset \
-    --epochs $epochs \
-    --batch_size $batch_size \
-    --lr $lr \
+    --num_subsets $GLOBAL_NUM_SUBSETS \
+    --classes_per_subset $GLOBAL_NUM_CLASSES \
+    --epochs $current_epochs \
+    --batch_size $current_batch_size \
+    --lr $current_lr \
     --num_workers $num_workers \
-    --data_dir "$data_dir" \
-    --output_dir "$output_dir" \
-    --seed $seed \
-    --val_split $val_split
+    --data_dir "$GLOBAL_DATA_DIR" \
+    --output_dir "$DIR_MODEL_ZOO" \
+    --seed $GLOBAL_SEED \
+    --val_split $GLOBAL_VAL_SPLIT

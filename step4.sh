@@ -1,176 +1,56 @@
 #!/bin/bash
+source ./global_config.sh
 
-# =============================================================================
-# Step 4: Train Latent Diffusion Model for Weight Generation
-# =============================================================================
-#
-# This script trains a latent diffusion model that generates neural network
-# weights conditioned on dataset samples.
-#
-# The diffusion model operates in the latent space of the VAE (from Step 2),
-# and uses a Task Encoder to condition generation on dataset samples.
-#
-# Pipeline:
-#   Dataset Samples → Task Encoder → Condition
-#                                       ↓
-#   Noise → Diffusion UNet → Latent → VAE Decoder → Generated Weights
-#
-# Prerequisites:
-# - Model Zoo weights from Step 1 (in ./Model_Zoo/Resnet18_TinyImageNet_HC/)
-# - (Recommended) VAE checkpoint from Step 2
-# - (Optional) Task Encoder checkpoint from Step 3
-# - TinyImageNet dataset
-# =============================================================================
-
-# --- Configuration ---
-
-# Quick sanity toggle:
-# - 1: fast smoke test (prints progress quickly, exits)
-# - 0: full training
+# --- 本步骤独立的训练超参数 ---
 dry_run=0
-log_every_n_steps=1
+log_every_n_steps=10
 
-# Path to trained classifier heads from Step 1
-weights_dir="./Model_Zoo/Resnet18_TinyImageNet_HC"
+current_epochs=500
+current_batch_size=8      # Diffusion 显存占用大，通常较小
+current_lr=0.0001
+num_timesteps=1000
+beta_schedule="linear"
+num_samples=5             # Conditioning 采样数
+num_workers=2
 
-# Path to TinyImageNet dataset
-tinyimagenet_dir="./tiny-imagenet-data/tiny-imagenet-200"
+accelerator="mps"
+devices=1
 
-# (Optional) VAE checkpoint from Step 2
-# If not provided, a simple VAE will be trained jointly
-# vae_checkpoint=""
-vae_checkpoint="./Pretrained_Components/VAE"
+# 自动推断上一阶段的 Checkpoints
+vae_ckpt_path="${DIR_VAE_OUTPUT}/checkpoints/last.ckpt"
+task_encoder_ckpt_path="${DIR_TASK_ENCODER_OUTPUT}/checkpoints/last.ckpt"
 
-# (Optional) Task Encoder checkpoint from Step 3
-# If not provided, task encoder is trained jointly with diffusion
-task_encoder_checkpoint="/Users/supawich/Documents/Duke/Term1/PracticalML/Parameter_Diffusion/components/task_encoder/checkpoints/task_encoder-epoch=10-val/loss=2.6895.ckpt"
-# task_encoder_checkpoint="./components/task_encoder/checkpoints/last.ckpt"
+# --- 执行 ---
+echo "Step 4: 训练 Latent Diffusion"
+echo "  - Latent Spec: ${GLOBAL_LATENT_CHANNELS} x ${GLOBAL_LATENT_SIZE} x ${GLOBAL_LATENT_SIZE}"
 
-# Path to DNNWG library
-dnnwg_path="./External/DNNWG"
-
-# Output directory
-output_dir="./components/diffusion"
-
-# Data parameters
-num_subsets=500          # Number of weight-dataset pairs
-num_classes=10           # Classes per subset
-num_samples=5            # Sample images per class
-
-# Model parameters
-num_timesteps=1000       # Diffusion timesteps
-beta_schedule="linear"   # Noise schedule: linear or cosine
-latent_channels=4        # Latent space channels
-latent_size=16           # Latent spatial size
-
-# Training parameters
-epochs=50               # Training epochs (staryt with 50 for first exp)
-batch_size=8             # Batch size (optimized for M4 Pro, increase to 16 if memory allows)
-lr=0.0001                # Learning rate
-num_workers=2            # DataLoader workers (lower for macOS)
-seed=42                  # Random seed
-
-# Device configuration
-# For Apple Silicon (M1/M2/M3/M4), we use MPS backend
-# Set to "mps" for Mac, "cuda" for NVIDIA GPU, "cpu" for CPU only
-accelerator="mps"        # Options: "mps", "cuda", "cpu", "auto"
-devices=1                # Number of devices
-
-val_split=0.1            # Validation split
-
+# 简易模式参数调整
 if [ "$dry_run" -eq 1 ]; then
-    num_subsets=8
-    num_samples=1
-    num_timesteps=25
-    epochs=1
-    batch_size=2
-    num_workers=0
-    val_split=0.5
+    echo "!!! DRY RUN MODE !!!"
+    current_epochs=1
+    GLOBAL_NUM_SUBSETS=8  # 临时覆盖全局变量仅用于 dry run
 fi
 
-# --- Download TinyImageNet if needed ---
-if [ ! -d "$tinyimagenet_dir" ]; then
-    echo "TinyImageNet not found. Downloading..."
-    mkdir -p "./tiny-imagenet-data"
-    cd "./tiny-imagenet-data"
-    
-    if [ ! -f "tiny-imagenet-200.zip" ]; then
-        echo "Downloading TinyImageNet (~240MB)..."
-        curl -L -o tiny-imagenet-200.zip http://cs231n.stanford.edu/tiny-imagenet-200.zip
-    fi
-    
-    echo "Extracting..."
-    unzip -q tiny-imagenet-200.zip
-    cd ..
-    echo "TinyImageNet downloaded and extracted."
-fi
-
-# --- Execution ---
-echo "=============================================="
-echo "Step 4: Train Latent Diffusion Model"
-echo "=============================================="
-echo ""
-echo "Configuration:"
-echo "  - Weights directory: $weights_dir"
-echo "  - TinyImageNet directory: $tinyimagenet_dir"
-echo "  - Output directory: $output_dir"
-echo "  - VAE checkpoint: ${vae_checkpoint:-'None (will train simple VAE)'}"
-echo "  - Task Encoder checkpoint: ${task_encoder_checkpoint:-'None (will train jointly)'}"
-echo ""
-echo "Model parameters:"
-echo "  - Diffusion timesteps: $num_timesteps"
-echo "  - Beta schedule: $beta_schedule"
-echo "  - Latent size: ${latent_channels}x${latent_size}x${latent_size}"
-if [ "$dry_run" -eq 1 ]; then
-    echo "  - Mode: DRY RUN (1 train + 1 val batch)"
-fi
-echo ""
-echo "Training parameters:"
-echo "  - Epochs: $epochs"
-echo "  - Batch size: $batch_size"
-echo "  - Learning rate: $lr"
-echo "  - Accelerator: $accelerator"
-echo ""
-
-# Build command
-cmd="python train_diffusion.py \
-    --weights_dir \"$weights_dir\" \
-    --tinyimagenet_dir \"$tinyimagenet_dir\" \
-    --dnnwg_path \"$dnnwg_path\" \
-    --output_dir \"$output_dir\" \
-    --num_subsets $num_subsets \
-    --num_classes $num_classes \
+python train_diffusion.py \
+    --weights_dir "$DIR_MODEL_ZOO" \
+    --tinyimagenet_dir "$GLOBAL_DATA_DIR" \
+    --dnnwg_path "$GLOBAL_DNNWG_PATH" \
+    --output_dir "$DIR_DIFFUSION_OUTPUT" \
+    --vae_checkpoint "$vae_ckpt_path" \
+    --task_encoder_checkpoint "$task_encoder_ckpt_path" \
+    --num_subsets $GLOBAL_NUM_SUBSETS \
+    --num_classes $GLOBAL_NUM_CLASSES \
     --num_samples $num_samples \
     --num_timesteps $num_timesteps \
     --beta_schedule $beta_schedule \
-    --latent_channels $latent_channels \
-    --latent_size $latent_size \
-    --epochs $epochs \
-    --batch_size $batch_size \
-    --lr $lr \
+    --latent_channels $GLOBAL_LATENT_CHANNELS \
+    --latent_size $GLOBAL_LATENT_SIZE \
+    --epochs $current_epochs \
+    --batch_size $current_batch_size \
+    --lr $current_lr \
     --num_workers $num_workers \
-    --seed $seed \
+    --seed $GLOBAL_SEED \
     --log_every_n_steps $log_every_n_steps \
     --accelerator $accelerator \
     --devices $devices \
-    --val_split $val_split"
-
-if [ "$dry_run" -eq 1 ]; then
-    cmd="$cmd --dry_run"
-fi
-
-# Add VAE checkpoint if specified
-if [ -n "$vae_checkpoint" ] && [ -f "$vae_checkpoint" ]; then
-    cmd="$cmd --vae_checkpoint \"$vae_checkpoint\""
-fi
-
-# Add Task Encoder checkpoint if specified
-if [ -n "$task_encoder_checkpoint" ] && [ -f "$task_encoder_checkpoint" ]; then
-    cmd="$cmd --task_encoder_checkpoint \"$task_encoder_checkpoint\""
-fi
-
-echo "Running command:"
-echo "$cmd"
-echo ""
-
-eval $cmd
+    --val_split $GLOBAL_VAL_SPLIT

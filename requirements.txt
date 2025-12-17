@@ -1,8 +1,20 @@
+# --- 深度学习核心 ---
 torch
 torchvision
 pytorch_lightning
-tqdm
 einops
+
+# --- 数据处理与工具 ---
 numpy
-pillow
+tqdm
 pyyaml
+pillow
+
+# --- [新增] 数据集下载 ---
+# train_model_zoo.py 中使用了 requests.get 下载 TinyImageNet
+requests
+
+# --- [新增] 可视化与交互环境 ---
+# 用于运行 Visualization.ipynb, operator.ipynb 等
+matplotlib
+jupyter

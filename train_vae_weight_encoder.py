@@ -174,6 +174,22 @@ def main():
         num_workers=args.num_workers
     )
 
+    # --- [关键修改] 正确检测设备 (包括 MPS) ---
+    target_device = 'cpu'
+    accelerator_type = 'cpu'
+    
+    if args.gpus > 0:
+        if torch.cuda.is_available():
+            target_device = 'cuda'
+            accelerator_type = 'gpu'
+        #elif torch.backends.mps.is_available():
+        #    target_device = 'mps'
+        #    accelerator_type = 'mps'  # 或者 'auto'
+        else:
+            print("警告: 指定了 GPU 但未找到 CUDA，回退到 CPU")
+            
+    print(f"Using device: {target_device}")
+
     # 3. 模型
     model = VAENoDiscModel(
         ddconfig=ddconfig,
@@ -181,7 +197,7 @@ def main():
         embed_dim=4,
         learning_rate=args.lr,
         input_key="weight",
-        device='cuda' if args.gpus > 0 and torch.cuda.is_available() else 'cpu',
+        device=target_device, # 传入正确的设备字符串
     )
 
     # 4. Trainer
@@ -194,7 +210,7 @@ def main():
     trainer = pl.Trainer(
         default_root_dir=output_path,
         max_epochs=args.epochs,
-        accelerator='gpu' if args.gpus > 0 else 'cpu',
+        accelerator=accelerator_type, # 明确指定加速器类型
         devices=args.gpus if args.gpus > 0 else "auto",
         callbacks=callbacks,
         log_every_n_steps=10
@@ -211,14 +227,15 @@ def main():
     # 简单的重建评估逻辑
     model = VAENoDiscModel.load_from_checkpoint(final_ckpt, ddconfig=ddconfig, lossconfig=lossconfig, embed_dim=4, input_key="weight", learning_rate=args.lr)
     model.eval()
-    model.to('cuda' if args.gpus > 0 else 'cpu')
+    model.to(target_device) # 确保移动到正确设备
     
     total_mse = 0
     count = 0
     dm.setup()
     with torch.no_grad():
         for batch in dm.val_dataloader():
-            inputs = batch['weight'].to(model.device)
+            # 同样使用修正后的 target_device
+            inputs = batch['weight'].to(model.device) 
             _, recon, _ = model(batch)
             total_mse += torch.nn.functional.mse_loss(inputs, recon).item() * inputs.size(0)
             count += inputs.size(0)
